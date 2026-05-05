@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 
 RUTA_PKL        = "modelo.pkl"
 PCTIL           = 70
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")  # Railway env var
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG FIJA
@@ -49,10 +49,11 @@ COLS_FIN = [
     "mom_pct_5d", "mom_pct_10d", "mom_pct_20d", "mom_pct_60d",
 ]
 
-DATA_DIR       = "/data"
-LOG_FILE       = f"{DATA_DIR}/cinax_paper.log"
-SEÑALES_CSV    = f"{DATA_DIR}/cinax_señales.csv"
-POSICIONES_CSV = f"{DATA_DIR}/cinax_posiciones.csv"
+DATA_DIR        = "/data"
+LOG_FILE        = f"{DATA_DIR}/cinax_paper.log"
+SEÑALES_CSV     = f"{DATA_DIR}/cinax_señales.csv"
+POSICIONES_CSV  = f"{DATA_DIR}/cinax_posiciones.csv"
+INTRA_CSV       = f"{DATA_DIR}/cinax_intra.csv"   # ← nuevo: OHLC intraposición
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -101,7 +102,6 @@ def discord_resumen_diario(fecha_barra, precio, prob, umbral, señal, cerradas_h
                    f"Probabilidad  : {prob:.4f}  (umbral {umbral:.4f})\n"
                    f"```")
 
-    # Posiciones cerradas hoy
     cierre_txt = ""
     if cerradas_hoy is not None and len(cerradas_hoy) > 0:
         lineas = []
@@ -111,7 +111,6 @@ def discord_resumen_diario(fecha_barra, precio, prob, umbral, señal, cerradas_h
             lineas.append(f"{emoji}  entry {p['entry_date']}  →  exit HOY   ret {ret*100:+.2f}%")
         cierre_txt = "\n**Posiciones cerradas hoy:**\n```\n" + "\n".join(lineas) + "\n```"
 
-    # Resumen acumulado
     resumen_txt = ""
     if os.path.exists(POSICIONES_CSV):
         df_all   = pd.read_csv(POSICIONES_CSV)
@@ -313,7 +312,81 @@ def abrir_posicion(fecha_barra, precio_entrada, prob, umbral):
         f"exit={exit_date.date()} (viernes) | prob={prob:.4f}", "SEÑAL")
     return exit_date
 
-def cerrar_posiciones_vencidas(df_feat):
+def registrar_barra_intra(df_raw, fecha_barra):
+    """
+    Para cada posición ABIERTA, guarda la barra OHLC del día actual
+    si la fecha está dentro del rango [entry_date+1, exit_date_esperado].
+    """
+    if not os.path.exists(POSICIONES_CSV):
+        return
+
+    df_pos   = pd.read_csv(POSICIONES_CSV, parse_dates=["entry_date","exit_date_esperado"])
+    abiertas = df_pos[df_pos["estado"] == "ABIERTA"]
+    if abiertas.empty:
+        return
+
+    hoy = fecha_barra.date()
+
+    # Obtener OHLC del día actual desde df_raw
+    if hoy not in df_raw.index.date:
+        return
+    barra = df_raw[df_raw.index.date == hoy].iloc[-1]
+    open_  = float(barra["open"])
+    high_  = float(barra["high"])
+    low_   = float(barra["low"])
+    close_ = float(barra["close"])
+
+    # Cargar intra existente para evitar duplicados
+    if os.path.exists(INTRA_CSV):
+        df_intra = pd.read_csv(INTRA_CSV)
+    else:
+        df_intra = pd.DataFrame(columns=["entry_date","fecha_barra","dia_semana",
+                                          "open","high","low","close",
+                                          "ret_vs_entry","ret_diario"])
+
+    nuevas = []
+    for _, pos in abiertas.iterrows():
+        entry_date = pos["entry_date"].date()
+        exit_date  = pos["exit_date_esperado"].date()
+
+        # Solo guardar días DESPUÉS de la entrada y HASTA el exit
+        if hoy <= entry_date or hoy > exit_date:
+            continue
+
+        # Evitar duplicar
+        ya_existe = (
+            (df_intra["entry_date"].astype(str) == str(entry_date)) &
+            (df_intra["fecha_barra"].astype(str) == str(hoy))
+        ).any() if len(df_intra) > 0 else False
+
+        if ya_existe:
+            continue
+
+        entry_price = float(pos["entry_price"])
+        ret_vs_entry = close_ / entry_price - 1
+        dia_str = fecha_barra.strftime("%A")
+
+        nuevas.append({
+            "entry_date":    str(entry_date),
+            "fecha_barra":   str(hoy),
+            "dia_semana":    dia_str,
+            "open":          round(open_, 2),
+            "high":          round(high_, 2),
+            "low":           round(low_, 2),
+            "close":         round(close_, 2),
+            "ret_vs_entry":  round(ret_vs_entry, 6),
+            "ret_diario":    round(close_ / open_ - 1, 6),
+        })
+        log(f"Intra guardada | pos={entry_date} | barra={hoy} | "
+            f"O={open_:.1f} H={high_:.1f} L={low_:.1f} C={close_:.1f} | "
+            f"ret_entry={ret_vs_entry:+.2%}")
+
+    if nuevas:
+        df_new   = pd.DataFrame(nuevas)
+        df_intra = pd.concat([df_intra, df_new], ignore_index=True)
+        df_intra.to_csv(INTRA_CSV, index=False)
+
+def cerrar_posiciones_vencidas(df_feat, df_raw):
     if not os.path.exists(POSICIONES_CSV):
         return pd.DataFrame()
     df_pos   = pd.read_csv(POSICIONES_CSV, parse_dates=["entry_date","exit_date_esperado"])
@@ -395,12 +468,6 @@ def main():
                 time.sleep(secs + 60)
                 continue
 
-            if dia_semana not in DIAS_ENTRADA:
-                secs = segundos_hasta_cierre()
-                log(f"{ahora_et.strftime('%A')} — día sin operación. Próxima en {secs/3600:.1f}h", "WARN")
-                time.sleep(secs + 60)
-                continue
-
             if not mercado_cerrado_hoy():
                 secs = segundos_hasta_cierre()
                 log(f"Esperando cierre en {secs/60:.0f} min...", "WARN")
@@ -421,28 +488,40 @@ def main():
             probs_h = modelo.predict_proba(X_hist)[:, 1]
             umbral  = float(np.percentile(probs_h, PCTIL))
 
+            # ── Registrar OHLC intra para posiciones abiertas (todos los días) ──
+            registrar_barra_intra(df_raw, fecha_barra)
+
             if fecha_barra == ultima_fecha_evaluada:
                 secs = segundos_hasta_cierre()
                 log(f"Barra {fecha_barra.date()} ya evaluada. Próxima en {secs/3600:.1f}h")
                 time.sleep(CHECK_MINS * 60)
                 continue
 
-            señal = prob >= umbral
-            info  = (f"{fecha_barra.date()} ({fecha_barra.strftime('%A')}) | "
-                     f"Close: {precio:.1f} | Prob: {prob:.4f} | Umbral: {umbral:.4f}")
+            # ── Solo días de entrada generan señal ──
+            if dia_semana in DIAS_ENTRADA:
+                señal = prob >= umbral
+                info  = (f"{fecha_barra.date()} ({fecha_barra.strftime('%A')}) | "
+                         f"Close: {precio:.1f} | Prob: {prob:.4f} | Umbral: {umbral:.4f}")
 
-            if señal:
-                log(f"★ SEÑAL LARGA ★ — {info}", "SEÑAL")
-                log(f"  → Exit: {next_friday(fecha_barra).date()} (viernes al CLOSE)", "SEÑAL")
-                abrir_posicion(fecha_barra, precio, prob, umbral)
+                if señal:
+                    log(f"★ SEÑAL LARGA ★ — {info}", "SEÑAL")
+                    log(f"  → Exit: {next_friday(fecha_barra).date()} (viernes al CLOSE)", "SEÑAL")
+                    abrir_posicion(fecha_barra, precio, prob, umbral)
+                else:
+                    log(f"Sin señal — {info}")
+
+                guardar_señal(fecha_barra, precio, prob, umbral, señal)
+                cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
+                resumen_log()
+                discord_resumen_diario(fecha_barra, precio, prob, umbral, señal,
+                                       cerradas_hoy if len(cerradas_hoy) > 0 else None)
             else:
-                log(f"Sin señal — {info}")
-
-            guardar_señal(fecha_barra, precio, prob, umbral, señal)
-            cerradas_hoy = cerrar_posiciones_vencidas(df_feat)
-            resumen_log()
-            discord_resumen_diario(fecha_barra, precio, prob, umbral, señal,
-                                   cerradas_hoy if len(cerradas_hoy) > 0 else None)
+                # Jueves/Viernes: solo cerrar posiciones vencidas, sin señal
+                señal = False
+                cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
+                if len(cerradas_hoy) > 0:
+                    resumen_log()
+                    discord_resumen_diario(fecha_barra, precio, prob, umbral, False, cerradas_hoy)
 
             ultima_fecha_evaluada = fecha_barra
             secs = segundos_hasta_cierre()
