@@ -10,6 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN chmod +x start.sh
-
-CMD ["bash", "start.sh"]
+CMD ["python", "cinax_v02.py"]
