@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Instalar libgomp (requerida por LightGBM)
 RUN apt-get update && apt-get install -y libgomp1 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -10,4 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "cinax_v02.py"]
+RUN chmod +x start.sh
+
+CMD ["bash", "start.sh"]
