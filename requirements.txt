@@ -5,5 +5,3 @@ pandas
 numpy
 pytz
 requests
-flask
-gunicorn
