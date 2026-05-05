@@ -2,6 +2,9 @@
 # Guarda datos en /data (volumen Railway persistente)
 # Envía resumen diario a Discord via webhook
 
+import subprocess
+subprocess.run(["apt-get", "install", "-y", "libgomp1"], capture_output=True)
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
