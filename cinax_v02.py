@@ -31,7 +31,7 @@ WINDOW_PCT   = 252
 MERCADO_TZ   = pytz.timezone("America/New_York")
 CHECK_MINS   = 60
 DIAS_ENTRADA = {0, 1, 2}
-NOMBRES_DIA  = {0:"Lunes", 1:"Martes", 2:"Miércoles"}
+NOMBRES_DIA  = {0:"Lunes", 1:"Martes", 2:"Miércoles", 3:"Jueves", 4:"Viernes"}
 
 MACRO_TICKERS = [
     "DX-Y.NYB","CL=F","HG=F","XLU","RSP","^VVIX","SMH","HYG",
@@ -53,7 +53,7 @@ DATA_DIR        = "/data"
 LOG_FILE        = f"{DATA_DIR}/cinax_paper.log"
 SEÑALES_CSV     = f"{DATA_DIR}/cinax_señales.csv"
 POSICIONES_CSV  = f"{DATA_DIR}/cinax_posiciones.csv"
-INTRA_CSV       = f"{DATA_DIR}/cinax_intra.csv"   # ← nuevo: OHLC intraposición
+INTRA_CSV       = f"{DATA_DIR}/cinax_intra.csv"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -82,6 +82,7 @@ def discord(mensaje):
         log(f"Discord error: {e}", "WARN")
 
 def discord_resumen_diario(fecha_barra, precio, prob, umbral, señal, cerradas_hoy=None):
+    """Mensaje para días Lun/Mar/Mié con o sin señal."""
     hoy    = fecha_barra.strftime("%Y-%m-%d")
     dia    = NOMBRES_DIA.get(fecha_barra.weekday(), "")
     sp_fmt = f"{precio:,.1f}"
@@ -102,33 +103,107 @@ def discord_resumen_diario(fecha_barra, precio, prob, umbral, señal, cerradas_h
                    f"Probabilidad  : {prob:.4f}  (umbral {umbral:.4f})\n"
                    f"```")
 
-    cierre_txt = ""
-    if cerradas_hoy is not None and len(cerradas_hoy) > 0:
-        lineas = []
-        for _, p in cerradas_hoy.iterrows():
-            ret   = float(p["retorno"])
-            emoji = "✅" if ret > 0 else "❌"
-            lineas.append(f"{emoji}  entry {p['entry_date']}  →  exit HOY   ret {ret*100:+.2f}%")
-        cierre_txt = "\n**Posiciones cerradas hoy:**\n```\n" + "\n".join(lineas) + "\n```"
-
-    resumen_txt = ""
-    if os.path.exists(POSICIONES_CSV):
-        df_all   = pd.read_csv(POSICIONES_CSV)
-        cerradas = df_all[df_all["estado"] == "CERRADA"]
-        abiertas = df_all[df_all["estado"] == "ABIERTA"]
-        if len(cerradas) > 0:
-            rets = cerradas["retorno"].astype(float)
-            wr   = (rets > 0).mean()
-            pf   = rets[rets > 0].sum() / (abs(rets[rets < 0].sum()) + 1e-8)
-            resumen_txt = (f"\n**Acumulado ({len(cerradas)} trades cerrados):**\n"
-                           f"```\n"
-                           f"Win Rate      : {wr:.1%}\n"
-                           f"Profit Factor : {pf:.2f}\n"
-                           f"Retorno acum  : {rets.sum()*100:+.1f}%\n"
-                           f"Abiertas ahora: {len(abiertas)}\n"
-                           f"```")
-
+    cierre_txt = _bloque_cerradas(cerradas_hoy)
+    resumen_txt = _bloque_acumulado()
     discord(f"{header}\n{detalle}{cierre_txt}{resumen_txt}")
+
+
+def discord_seguimiento_posicion(fecha_barra, precio_actual, cerradas_hoy=None):
+    """
+    FIX: mensaje diario de seguimiento para Jue/Vie (o cualquier día)
+    cuando hay posiciones abiertas, aunque no haya señal ni cierre.
+    """
+    if not os.path.exists(POSICIONES_CSV):
+        return
+
+    df_pos   = pd.read_csv(POSICIONES_CSV)
+    abiertas = df_pos[df_pos["estado"] == "ABIERTA"]
+
+    cierre_txt = _bloque_cerradas(cerradas_hoy)
+
+    if abiertas.empty and not cierre_txt:
+        return  # nada que reportar
+
+    hoy = fecha_barra.strftime("%Y-%m-%d")
+    dia = NOMBRES_DIA.get(fecha_barra.weekday(), "")
+    header = f"📊 **CINAX — Seguimiento** | {hoy} ({dia})"
+
+    pos_txt = ""
+    if not abiertas.empty:
+        lineas = []
+        for _, p in abiertas.iterrows():
+            entry_price = float(p["entry_price"])
+            ret_actual  = precio_actual / entry_price - 1
+            exit_esp    = p["exit_date_esperado"]
+            emoji = "🟢" if ret_actual >= 0 else "🔴"
+            lineas.append(
+                f"{emoji}  entry {p['entry_date']} @ {entry_price:,.1f}"
+                f"  →  ahora {precio_actual:,.1f}"
+                f"  ret {ret_actual*100:+.2f}%"
+                f"  | exit {exit_esp}"
+            )
+        pos_txt = "\n**Posiciones abiertas:**\n```\n" + "\n".join(lineas) + "\n```"
+
+    resumen_txt = _bloque_acumulado()
+    discord(f"{header}{pos_txt}{cierre_txt}{resumen_txt}")
+
+
+def discord_prevision_lunes(fecha_viernes, precio, prob, umbral):
+    """
+    FIX: mensaje el viernes al cierre con la previsión para el lunes.
+    El modelo calcula la señal del lunes usando los datos del viernes.
+    """
+    lunes = fecha_viernes + pd.Timedelta(days=3)
+    lunes_str = lunes.strftime("%Y-%m-%d")
+    hoy_str   = fecha_viernes.strftime("%Y-%m-%d")
+
+    if prob >= umbral:
+        header  = f"🔔 **CINAX — SEÑAL PREVISTA LUNES** | calc. {hoy_str} (Viernes)"
+        detalle = (f"```\n"
+                   f"S&P 500 Close viernes : {precio:,.1f}\n"
+                   f"Probabilidad          : {prob:.4f}  (umbral {umbral:.4f})\n"
+                   f"→ Señal esperada      : LUNES {lunes_str} al CLOSE\n"
+                   f"  Exit esperado       : {next_friday(lunes).strftime('%Y-%m-%d')} (viernes)\n"
+                   f"```")
+    else:
+        header  = f"⚪ **CINAX — Sin señal para el lunes** | calc. {hoy_str} (Viernes)"
+        detalle = (f"```\n"
+                   f"S&P 500 Close viernes : {precio:,.1f}\n"
+                   f"Probabilidad          : {prob:.4f}  (umbral {umbral:.4f})\n"
+                   f"```")
+
+    discord(f"{header}\n{detalle}")
+
+
+def _bloque_cerradas(cerradas_hoy):
+    if cerradas_hoy is None or len(cerradas_hoy) == 0:
+        return ""
+    lineas = []
+    for _, p in cerradas_hoy.iterrows():
+        ret   = float(p["retorno"])
+        emoji = "✅" if ret > 0 else "❌"
+        lineas.append(f"{emoji}  entry {p['entry_date']}  →  exit HOY   ret {ret*100:+.2f}%")
+    return "\n**Posiciones cerradas hoy:**\n```\n" + "\n".join(lineas) + "\n```"
+
+
+def _bloque_acumulado():
+    if not os.path.exists(POSICIONES_CSV):
+        return ""
+    df_all   = pd.read_csv(POSICIONES_CSV)
+    cerradas = df_all[df_all["estado"] == "CERRADA"]
+    abiertas = df_all[df_all["estado"] == "ABIERTA"]
+    if len(cerradas) == 0:
+        return ""
+    rets = cerradas["retorno"].astype(float)
+    wr   = (rets > 0).mean()
+    pf   = rets[rets > 0].sum() / (abs(rets[rets < 0].sum()) + 1e-8)
+    return (f"\n**Acumulado ({len(cerradas)} trades cerrados):**\n"
+            f"```\n"
+            f"Win Rate      : {wr:.1%}\n"
+            f"Profit Factor : {pf:.2f}\n"
+            f"Retorno acum  : {rets.sum()*100:+.1f}%\n"
+            f"Abiertas ahora: {len(abiertas)}\n"
+            f"```")
 
 # ══════════════════════════════════════════════════════════════
 # HORARIO
@@ -188,7 +263,7 @@ def descargar_datos():
     return df_raw
 
 # ══════════════════════════════════════════════════════════════
-# FEATURES
+# FEATURES  ← NO TOCAR
 # ══════════════════════════════════════════════════════════════
 
 def pctil_roll(series, w=WINDOW_PCT):
@@ -273,7 +348,7 @@ def build_features(d):
     return d.dropna()
 
 # ══════════════════════════════════════════════════════════════
-# PREDICCIÓN
+# PREDICCIÓN  ← NO TOCAR
 # ══════════════════════════════════════════════════════════════
 
 def predecir(modelo, df_feat):
@@ -313,10 +388,7 @@ def abrir_posicion(fecha_barra, precio_entrada, prob, umbral):
     return exit_date
 
 def registrar_barra_intra(df_raw, fecha_barra):
-    """
-    Para cada posición ABIERTA, guarda la barra OHLC del día actual
-    si la fecha está dentro del rango [entry_date+1, exit_date_esperado].
-    """
+    """Guarda OHLC del día para posiciones abiertas."""
     if not os.path.exists(POSICIONES_CSV):
         return
 
@@ -326,17 +398,15 @@ def registrar_barra_intra(df_raw, fecha_barra):
         return
 
     hoy = fecha_barra.date()
-
-    # Obtener OHLC del día actual desde df_raw
     if hoy not in df_raw.index.date:
         return
-    barra = df_raw[df_raw.index.date == hoy].iloc[-1]
+
+    barra  = df_raw[df_raw.index.date == hoy].iloc[-1]
     open_  = float(barra["open"])
     high_  = float(barra["high"])
     low_   = float(barra["low"])
     close_ = float(barra["close"])
 
-    # Cargar intra existente para evitar duplicados
     if os.path.exists(INTRA_CSV):
         df_intra = pd.read_csv(INTRA_CSV)
     else:
@@ -349,11 +419,9 @@ def registrar_barra_intra(df_raw, fecha_barra):
         entry_date = pos["entry_date"].date()
         exit_date  = pos["exit_date_esperado"].date()
 
-        # Solo guardar días DESPUÉS de la entrada y HASTA el exit
         if hoy <= entry_date or hoy > exit_date:
             continue
 
-        # Evitar duplicar
         ya_existe = (
             (df_intra["entry_date"].astype(str) == str(entry_date)) &
             (df_intra["fecha_barra"].astype(str) == str(hoy))
@@ -362,20 +430,20 @@ def registrar_barra_intra(df_raw, fecha_barra):
         if ya_existe:
             continue
 
-        entry_price = float(pos["entry_price"])
+        entry_price  = float(pos["entry_price"])
         ret_vs_entry = close_ / entry_price - 1
-        dia_str = fecha_barra.strftime("%A")
+        dia_str      = fecha_barra.strftime("%A")
 
         nuevas.append({
-            "entry_date":    str(entry_date),
-            "fecha_barra":   str(hoy),
-            "dia_semana":    dia_str,
-            "open":          round(open_, 2),
-            "high":          round(high_, 2),
-            "low":           round(low_, 2),
-            "close":         round(close_, 2),
-            "ret_vs_entry":  round(ret_vs_entry, 6),
-            "ret_diario":    round(close_ / open_ - 1, 6),
+            "entry_date":   str(entry_date),
+            "fecha_barra":  str(hoy),
+            "dia_semana":   dia_str,
+            "open":         round(open_, 2),
+            "high":         round(high_, 2),
+            "low":          round(low_, 2),
+            "close":        round(close_, 2),
+            "ret_vs_entry": round(ret_vs_entry, 6),
+            "ret_diario":   round(close_ / open_ - 1, 6),
         })
         log(f"Intra guardada | pos={entry_date} | barra={hoy} | "
             f"O={open_:.1f} H={high_:.1f} L={low_:.1f} C={close_:.1f} | "
@@ -403,8 +471,8 @@ def cerrar_posiciones_vencidas(df_feat, df_raw):
             fechas_post = df_feat.index.date[df_feat.index.date >= exit_esp]
             if len(fechas_post) == 0:
                 continue
-            fecha_real     = fechas_post[0]
-            precio_cierre  = float(df_feat[df_feat.index.date == fecha_real]["close"].iloc[-1])
+            fecha_real    = fechas_post[0]
+            precio_cierre = float(df_feat[df_feat.index.date == fecha_real]["close"].iloc[-1])
             precio_entrada = float(pos["entry_price"])
             retorno        = precio_cierre / precio_entrada - 1
 
@@ -497,7 +565,9 @@ def main():
                 time.sleep(CHECK_MINS * 60)
                 continue
 
-            # ── Solo días de entrada generan señal ──
+            cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
+
+            # ── Lun / Mar / Mié: evaluar señal ──────────────────────────────
             if dia_semana in DIAS_ENTRADA:
                 señal = prob >= umbral
                 info  = (f"{fecha_barra.date()} ({fecha_barra.strftime('%A')}) | "
@@ -511,17 +581,37 @@ def main():
                     log(f"Sin señal — {info}")
 
                 guardar_señal(fecha_barra, precio, prob, umbral, señal)
-                cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
                 resumen_log()
-                discord_resumen_diario(fecha_barra, precio, prob, umbral, señal,
-                                       cerradas_hoy if len(cerradas_hoy) > 0 else None)
-            else:
-                # Jueves/Viernes: solo cerrar posiciones vencidas, sin señal
-                señal = False
-                cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
+                discord_resumen_diario(
+                    fecha_barra, precio, prob, umbral, señal,
+                    cerradas_hoy if len(cerradas_hoy) > 0 else None
+                )
+
+            # ── Jueves: seguimiento de posición abierta ──────────────────────
+            elif dia_semana == 3:
+                resumen_log()
+                # FIX: siempre mandar seguimiento si hay posición abierta
+                discord_seguimiento_posicion(
+                    fecha_barra, precio,
+                    cerradas_hoy if len(cerradas_hoy) > 0 else None
+                )
+
+            # ── Viernes: cerrar vencidas + calcular señal del LUNES ──────────
+            elif dia_semana == 4:
+                resumen_log()
+
+                # FIX: el viernes se calcula la señal para el lunes próximo
+                # usando los datos de cierre de hoy (viernes).
+                # La señal se registra como "prevista" pero NO abre posición aún.
+                log(f"Viernes — calculando previsión para el lunes...")
+                discord_prevision_lunes(fecha_barra, precio, prob, umbral)
+
+                # Si además hay posiciones abiertas o cerradas hoy, reportar
                 if len(cerradas_hoy) > 0:
-                    resumen_log()
-                    discord_resumen_diario(fecha_barra, precio, prob, umbral, False, cerradas_hoy)
+                    discord_seguimiento_posicion(
+                        fecha_barra, precio,
+                        cerradas_hoy
+                    )
 
             ultima_fecha_evaluada = fecha_barra
             secs = segundos_hasta_cierre()
