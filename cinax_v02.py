@@ -103,16 +103,13 @@ def discord_resumen_diario(fecha_barra, precio, prob, umbral, señal, cerradas_h
                    f"Probabilidad  : {prob:.4f}  (umbral {umbral:.4f})\n"
                    f"```")
 
-    cierre_txt = _bloque_cerradas(cerradas_hoy)
+    cierre_txt  = _bloque_cerradas(cerradas_hoy)
     resumen_txt = _bloque_acumulado()
     discord(f"{header}\n{detalle}{cierre_txt}{resumen_txt}")
 
 
 def discord_seguimiento_posicion(fecha_barra, precio_actual, cerradas_hoy=None):
-    """
-    FIX: mensaje diario de seguimiento para Jue/Vie (o cualquier día)
-    cuando hay posiciones abiertas, aunque no haya señal ni cierre.
-    """
+    """Mensaje diario de seguimiento cuando hay posiciones abiertas."""
     if not os.path.exists(POSICIONES_CSV):
         return
 
@@ -124,8 +121,8 @@ def discord_seguimiento_posicion(fecha_barra, precio_actual, cerradas_hoy=None):
     if abiertas.empty and not cierre_txt:
         return  # nada que reportar
 
-    hoy = fecha_barra.strftime("%Y-%m-%d")
-    dia = NOMBRES_DIA.get(fecha_barra.weekday(), "")
+    hoy    = fecha_barra.strftime("%Y-%m-%d")
+    dia    = NOMBRES_DIA.get(fecha_barra.weekday(), "")
     header = f"📊 **CINAX — Seguimiento** | {hoy} ({dia})"
 
     pos_txt = ""
@@ -146,33 +143,6 @@ def discord_seguimiento_posicion(fecha_barra, precio_actual, cerradas_hoy=None):
 
     resumen_txt = _bloque_acumulado()
     discord(f"{header}{pos_txt}{cierre_txt}{resumen_txt}")
-
-
-def discord_prevision_lunes(fecha_viernes, precio, prob, umbral):
-    """
-    FIX: mensaje el viernes al cierre con la previsión para el lunes.
-    El modelo calcula la señal del lunes usando los datos del viernes.
-    """
-    lunes = fecha_viernes + pd.Timedelta(days=3)
-    lunes_str = lunes.strftime("%Y-%m-%d")
-    hoy_str   = fecha_viernes.strftime("%Y-%m-%d")
-
-    if prob >= umbral:
-        header  = f"🔔 **CINAX — SEÑAL PREVISTA LUNES** | calc. {hoy_str} (Viernes)"
-        detalle = (f"```\n"
-                   f"S&P 500 Close viernes : {precio:,.1f}\n"
-                   f"Probabilidad          : {prob:.4f}  (umbral {umbral:.4f})\n"
-                   f"→ Señal esperada      : LUNES {lunes_str} al CLOSE\n"
-                   f"  Exit esperado       : {next_friday(lunes).strftime('%Y-%m-%d')} (viernes)\n"
-                   f"```")
-    else:
-        header  = f"⚪ **CINAX — Sin señal para el lunes** | calc. {hoy_str} (Viernes)"
-        detalle = (f"```\n"
-                   f"S&P 500 Close viernes : {precio:,.1f}\n"
-                   f"Probabilidad          : {prob:.4f}  (umbral {umbral:.4f})\n"
-                   f"```")
-
-    discord(f"{header}\n{detalle}")
 
 
 def _bloque_cerradas(cerradas_hoy):
@@ -471,8 +441,8 @@ def cerrar_posiciones_vencidas(df_feat, df_raw):
             fechas_post = df_feat.index.date[df_feat.index.date >= exit_esp]
             if len(fechas_post) == 0:
                 continue
-            fecha_real    = fechas_post[0]
-            precio_cierre = float(df_feat[df_feat.index.date == fecha_real]["close"].iloc[-1])
+            fecha_real     = fechas_post[0]
+            precio_cierre  = float(df_feat[df_feat.index.date == fecha_real]["close"].iloc[-1])
             precio_entrada = float(pos["entry_price"])
             retorno        = precio_cierre / precio_entrada - 1
 
@@ -590,23 +560,14 @@ def main():
             # ── Jueves: seguimiento de posición abierta ──────────────────────
             elif dia_semana == 3:
                 resumen_log()
-                # FIX: siempre mandar seguimiento si hay posición abierta
                 discord_seguimiento_posicion(
                     fecha_barra, precio,
                     cerradas_hoy if len(cerradas_hoy) > 0 else None
                 )
 
-            # ── Viernes: cerrar vencidas + calcular señal del LUNES ──────────
+            # ── Viernes: cerrar vencidas + seguimiento ────────────────────────
             elif dia_semana == 4:
                 resumen_log()
-
-                # FIX: el viernes se calcula la señal para el lunes próximo
-                # usando los datos de cierre de hoy (viernes).
-                # La señal se registra como "prevista" pero NO abre posición aún.
-                log(f"Viernes — calculando previsión para el lunes...")
-                discord_prevision_lunes(fecha_barra, precio, prob, umbral)
-
-                # Si además hay posiciones abiertas o cerradas hoy, reportar
                 if len(cerradas_hoy) > 0:
                     discord_seguimiento_posicion(
                         fecha_barra, precio,
